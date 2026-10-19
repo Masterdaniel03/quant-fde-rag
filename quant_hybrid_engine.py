@@ -39,8 +39,12 @@ class QuantHybridEngine:
             points.append(PointStruct(id=idx, vector=vector, payload=item))
         self.qdrant.upsert(collection_name=self.collection_name, points=points)
         self.bm25 = BM25Okapi(tokenized_corpus)
+        tokenized_corpus = [doc["text"].lower().split() for doc in self.documents]
 
     def hybrid_retrieve_rrf(self, query: str, top_k: int = 2, k_rrf: int = 60) -> list[dict]:
+        if not self.documents or self.bm25 is None:
+            return []
+        query_tokens = query.lower().split()
         query_vec = self._deterministic_embed(query)
         vector_hits = self.qdrant.query_points(
             collection_name=self.collection_name,
@@ -48,14 +52,14 @@ class QuantHybridEngine:
             limit=len(self.documents),
         ).points
 
-        bm25_scores = self.bm25.get_scores(query.lower().split())
+        bm25_scores = self.bm25.get_scores(query_tokens)
         bm25_ranks = np.argsort(bm25_scores)[::-1]
 
         n_docs = len(self.documents)
         rrf_scores = np.zeros(n_docs, dtype=np.float64)
 
         for rank, hit in enumerate(vector_hits):
-            rrf_scores[hit.id] += 1.0 / (k_rrf + rank + 1)
+            rrf_scores[int(hit.id)] += 1.0 / (k_rrf + rank + 1)
 
         for rank, doc_id in enumerate(bm25_ranks):
             rrf_scores[doc_id] += 1.0 / (k_rrf + rank + 1)
