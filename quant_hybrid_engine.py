@@ -1,6 +1,15 @@
 import hashlib
+import re
+
 import numpy as np
+from curl_cffi.requests.exceptions import RequestException
 import yfinance as yf
+from yfinance.exceptions import (
+    YFException,
+    YFPricesMissingError,
+    YFRateLimitError,
+    YFTickerMissingError,
+)
 from rank_bm25 import BM25Okapi
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
@@ -39,7 +48,6 @@ class QuantHybridEngine:
             points.append(PointStruct(id=idx, vector=vector, payload=item))
         self.qdrant.upsert(collection_name=self.collection_name, points=points)
         self.bm25 = BM25Okapi(tokenized_corpus)
-        tokenized_corpus = [doc["text"].lower().split() for doc in self.documents]
 
     def hybrid_retrieve_rrf(self, query: str, top_k: int = 2, k_rrf: int = 60) -> list[dict]:
         if not self.documents or self.bm25 is None:
@@ -72,18 +80,44 @@ class QuantHybridEngine:
             results.append(doc)
         return results
 
-    def compute_structured_market_metrics(self, ticker: str, period: str = "6mo") -> dict:
-        try:
-            df = yf.Ticker(ticker).history(period=period)
-        except Exception:
-            df = None
+    def compute_structured_market_metrics(
+        self, ticker: str, period: str = "6mo"
+    ) -> dict[str, float | str | None]:
+        normalized_ticker = ticker.strip().upper()
+        fallback_reason: str | None = None
 
-        if df is None or df.empty or len(df) < 5:
-            np.random.seed(42)
-            returns = np.random.normal(0.0012, 0.021, 126)
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9.-]{0,14}", normalized_ticker):
+            fallback_reason = "invalid_ticker"
+            df = None
+        else:
+            try:
+                df = yf.Ticker(normalized_ticker).history(period=period)
+            except YFRateLimitError:
+                df = None
+                fallback_reason = "rate_limited"
+            except (YFTickerMissingError, YFPricesMissingError):
+                df = None
+                fallback_reason = "ticker_unavailable"
+            except YFException:
+                df = None
+                fallback_reason = "market_data_unavailable"
+            except (RequestException, TimeoutError, OSError):
+                df = None
+                fallback_reason = "market_data_unavailable"
+
+        market_data_source = "yfinance"
+        if df is None or df.empty or "Close" not in df:
+            prices = None
+        else:
+            prices = df["Close"].dropna().to_numpy(dtype=np.float64)
+
+        if prices is None or len(prices) < 5 or not np.all(np.isfinite(prices)) or np.any(prices <= 0):
+            if fallback_reason is None:
+                fallback_reason = "insufficient_market_data"
+            market_data_source = "deterministic_fallback"
+            returns = np.random.RandomState(42).normal(0.0012, 0.021, 126)
             prices = 100.0 * np.exp(np.cumsum(returns))
         else:
-            prices = df["Close"].to_numpy(dtype=np.float64)
             returns = np.diff(prices) / prices[:-1]
 
         ann_volatility = float(np.std(returns) * np.sqrt(252))
@@ -95,9 +129,11 @@ class QuantHybridEngine:
         max_drawdown = float(np.min(drawdowns))
 
         return {
-            "ticker": ticker.upper(),
+            "ticker": normalized_ticker,
             "annualized_volatility_pct": round(ann_volatility * 100, 2),
             "sharpe_ratio": round(sharpe_ratio, 2),
             "max_drawdown_pct": round(max_drawdown * 100, 2),
             "latest_price": round(float(prices[-1]), 2),
+            "market_data_source": market_data_source,
+            "fallback_reason": fallback_reason,
         }
